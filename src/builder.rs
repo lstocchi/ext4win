@@ -332,66 +332,69 @@ impl Ext4ImageBuilder {
         self.group_descriptors[0].bg_used_dirs_count_lo += 1;
     }
 
-    fn add_dir_entry_to_root(&mut self, name: &str, inode: u32, file_type: u8) {
-        let root_extent_raw = &self.groups[0].inode_table[1].i_block[12..24];
-        let extent: Ext4Extent = zerocopy::FromBytes::read_from_bytes(root_extent_raw).unwrap();
-        let root_block_num = extent.ee_start_lo;
-        let block_offset = root_block_num as usize * BLOCK_SIZE;
+    pub fn add_dir_entry(&mut self, parent_ino: u32, name: &str, child_ino: u32, file_type: u8) {
+        let inodes_per_group = self.superblock.s_inodes_per_group;
+        let p_group_idx = ((parent_ino - 1) / inodes_per_group) as usize;
+        let p_local_idx = ((parent_ino - 1) % inodes_per_group) as usize;
+
+        // Retrieve parent inode's extent tree to find its data block
+        let extent_raw = &self.groups[p_group_idx].inode_table[p_local_idx].i_block[12..24];
+        let extent: Ext4Extent = zerocopy::FromBytes::read_from_bytes(extent_raw).unwrap();
+
+        let parent_block_num = extent.ee_start_lo;
+        let block_offset = parent_block_num as usize * BLOCK_SIZE;
 
         let name_bytes = name.as_bytes();
         let name_len = name_bytes.len() as u8;
 
-        // Calculate the required rec_len to fit the entry (rounded up to 4-byte boundary)
+        // Calculate required rec_len rounded up to 4-byte boundary
         let needed_rec_len = ((8 + name_len as u16 + 3) / 4) * 4;
 
-        // Find the last entry in the root dir block
         let mut current_offset = 0;
         while current_offset < BLOCK_SIZE {
             let entry_slice =
                 &self.disk_data[block_offset + current_offset..block_offset + current_offset + 8];
             let entry_header: Ext4DirEntry2Header =
                 zerocopy::FromBytes::read_from_bytes(entry_slice).unwrap();
-
             let rec_len = entry_header.rec_len as usize;
 
+            // If we've reached the last entry in the block (spans to the end of BLOCK_SIZE)
             if current_offset + rec_len == BLOCK_SIZE {
-                // Shrink the previous entry's rec_len to its actual size
                 let actual_entry_size = ((8 + entry_header.name_len as usize + 3) / 4) * 4;
-
                 let available_space = rec_len - actual_entry_size;
+
                 if available_space < needed_rec_len as usize {
-                    // TODO: Expand the directory block to add more space
                     panic!(
                         "Not enough space in the directory block to add entry for {}",
                         name
                     );
                 }
 
+                // Shrink previous entry's rec_len
                 let updated_prev_rec_len = actual_entry_size as u16;
                 self.disk_data
                     [block_offset + current_offset + 4..block_offset + current_offset + 6]
                     .copy_from_slice(&updated_prev_rec_len.to_le_bytes());
 
+                // Write new entry into the available space
                 let new_entry_offset = current_offset + actual_entry_size;
                 let new_rec_len = (BLOCK_SIZE - new_entry_offset) as u16;
 
                 let new_entry_header = Ext4DirEntry2Header {
-                    inode,
+                    inode: child_ino,
                     rec_len: new_rec_len,
                     name_len,
                     file_type,
                 };
-                let new_entry_bytes = new_entry_header.as_bytes();
+
                 self.disk_data
                     [block_offset + new_entry_offset..block_offset + new_entry_offset + 8]
-                    .copy_from_slice(new_entry_bytes);
+                    .copy_from_slice(new_entry_header.as_bytes());
                 self.disk_data[block_offset + new_entry_offset + 8
                     ..block_offset + new_entry_offset + 8 + (name_len as usize)]
                     .copy_from_slice(name_bytes);
-
                 break;
             }
-
             current_offset += rec_len;
         }
     }
@@ -481,7 +484,7 @@ impl Ext4ImageBuilder {
         self.groups[0].inode_table[local_inode_idx as usize] = lpf_inode;
         self.mark_inode_used(0, lpf_inode_num);
 
-        self.add_dir_entry_to_root("lost+found", lpf_inode_num, EXT4_FT_DIR);
+        self.add_dir_entry(EXT4_ROOT_INO, "lost+found", lpf_inode_num, EXT4_FT_DIR);
 
         // update root inode's link count (due to lost+found/.. directory pointing to root)
         self.groups[0].inode_table[1].i_links_count += 1;
@@ -521,5 +524,203 @@ impl Ext4ImageBuilder {
         let mut file = File::create(output_path)?;
         file.write_all(&self.disk_data)?;
         Ok(())
+    }
+
+    pub fn is_inode_allocated(&self, ino: u32) -> bool {
+        let inodes_per_group = self.superblock.s_inodes_per_group as usize;
+        let group = (ino - 1) / inodes_per_group as u32;
+        let index_in_group = (ino - 1) % inodes_per_group as u32;
+
+        let byte_idx = (index_in_group / 8) as usize;
+        let bit_idx = index_in_group % 8;
+
+        // Check the bit inside the specific block group's inode_bitmap
+        self.groups[group as usize].inode_bitmap[byte_idx] & (1 << bit_idx) != 0
+    }
+
+    pub fn allocate_inode(&mut self, parent_dir_ino: Option<u32>) -> Result<u32, String> {
+        let total_inodes = self.superblock.s_inodes_count as usize;
+        let inodes_per_group = self.superblock.s_inodes_per_group as usize;
+
+        let start_ino = match parent_dir_ino {
+            Some(dir) if dir > 0 && dir <= total_inodes as u32 => {
+                ((dir - 1) / inodes_per_group as u32) * inodes_per_group as u32 + 1
+            }
+            _ => 1,
+        };
+        let mut allocated_ino = None;
+        for ino in start_ino..=total_inodes as u32 {
+            if !self.is_inode_allocated(ino) {
+                allocated_ino = Some(ino);
+                break;
+            }
+        }
+
+        if allocated_ino.is_none() && start_ino > 1 {
+            for ino in 1..start_ino {
+                if !self.is_inode_allocated(ino) {
+                    allocated_ino = Some(ino);
+                    break;
+                }
+            }
+        }
+        let ino = allocated_ino.ok_or_else(|| "No free inodes available".to_string())?;
+
+        let group_idx = ((ino - 1) / inodes_per_group as u32) as usize;
+        self.mark_inode_used(group_idx, ino);
+
+        Ok(ino)
+    }
+
+    pub fn mkdir(&mut self, parent_ino: u32, name: &str) -> Result<u32, String> {
+        if name.is_empty()
+            || name == "."
+            || name == ".."
+            || name.len() > u8::MAX as usize
+            || name.contains('/')
+        {
+            return Err(
+                "directory name must be a non-empty component no longer than 255 bytes".to_string(),
+            );
+        }
+
+        let total_inodes = self.superblock.s_inodes_count;
+        if parent_ino == 0 || parent_ino > total_inodes || !self.is_inode_allocated(parent_ino) {
+            return Err(format!("parent inode {parent_ino} does not exist"));
+        }
+
+        let inodes_per_group = self.superblock.s_inodes_per_group;
+        let p_group_idx = ((parent_ino - 1) / inodes_per_group) as usize;
+        let p_local_idx = ((parent_ino - 1) % inodes_per_group) as usize;
+        if self.groups[p_group_idx].inode_table[p_local_idx].i_mode & S_IFDIR != S_IFDIR {
+            return Err(format!("parent inode {parent_ino} is not a directory"));
+        }
+
+        let dir_ino = self.allocate_inode(Some(parent_ino))?;
+
+        let dir_group_idx = ((dir_ino - 1) / inodes_per_group) as usize;
+        let dir_local_idx = ((dir_ino - 1) % inodes_per_group) as usize;
+
+        let dir_data_block = self.allocate_free_block(dir_group_idx);
+
+        let mut dir_block = vec![0u8; BLOCK_SIZE];
+
+        // Entry "."
+        let dot_header = Ext4DirEntry2Header {
+            inode: dir_ino,
+            rec_len: 12, // 8 byte header + 1 char '.' + 3 padding
+            name_len: 1,
+            file_type: EXT4_FT_DIR,
+        };
+        let dot_bytes = dot_header.as_bytes();
+        dir_block[..8].copy_from_slice(dot_bytes);
+        dir_block[8] = b'.';
+
+        // Entry ".."
+        let dot_dot_header = Ext4DirEntry2Header {
+            inode: parent_ino,
+            rec_len: (BLOCK_SIZE - 12) as u16,
+            name_len: 2,
+            file_type: EXT4_FT_DIR,
+        };
+        let dot_dot_bytes = dot_dot_header.as_bytes();
+        dir_block[12..20].copy_from_slice(dot_dot_bytes);
+        dir_block[20..22].copy_from_slice(b"..");
+
+        let disk_offset = (dir_data_block as usize) * BLOCK_SIZE;
+        self.disk_data[disk_offset..disk_offset + BLOCK_SIZE].copy_from_slice(&dir_block);
+
+        let mut dir_inode = Ext4Inode::default();
+        dir_inode.i_mode = S_IFDIR | 0o755;
+        dir_inode.i_uid = 0;
+        dir_inode.i_gid = 0;
+        dir_inode.i_size_lo = BLOCK_SIZE as u32;
+        dir_inode.i_links_count = 2;
+        dir_inode.i_blocks_lo = BLOCK_SIZE as u32 / 512;
+        dir_inode.i_flags = EXT4_EXTENTS_FL;
+
+        let header = Ext4ExtentHeader {
+            eh_magic: EXT4_EH_MAGIC,
+            eh_entries: 1,
+            eh_max: 4,
+            eh_depth: 0,
+            eh_generation: 0,
+        };
+
+        let extent = Ext4Extent {
+            ee_block: 0,
+            ee_len: 1,
+            ee_start_hi: 0,
+            ee_start_lo: dir_data_block,
+        };
+
+        let header_bytes = header.as_bytes();
+        let extent_bytes = extent.as_bytes();
+        dir_inode.i_block[..12].copy_from_slice(header_bytes);
+        dir_inode.i_block[12..24].copy_from_slice(extent_bytes);
+
+        self.groups[dir_group_idx].inode_table[dir_local_idx] = dir_inode;
+        self.group_descriptors[dir_group_idx].bg_used_dirs_count_lo += 1;
+
+        self.add_dir_entry(parent_ino, name, dir_ino, EXT4_FT_DIR);
+        self.groups[p_group_idx].inode_table[p_local_idx].i_links_count += 1;
+
+        Ok(dir_ino)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zerocopy::FromBytes;
+
+    #[test]
+    fn mkdir_creates_a_reachable_directory_without_double_accounting() {
+        let mut builder = Ext4ImageBuilder::new(16);
+        builder.create_root_dir();
+        builder.create_lost_and_found();
+        builder.reserve_inodes();
+
+        let free_inodes_before = builder.superblock.s_free_inodes_count;
+        let child_ino = builder.mkdir(EXT4_ROOT_INO, "projects").unwrap();
+
+        assert!(builder.is_inode_allocated(child_ino));
+        let free_inodes_after = builder.superblock.s_free_inodes_count;
+        let root_links = builder.groups[0].inode_table[1].i_links_count;
+        assert_eq!(free_inodes_after, free_inodes_before - 1);
+        assert_eq!(root_links, 4);
+
+        let root_extent =
+            Ext4Extent::read_from_bytes(&builder.groups[0].inode_table[1].i_block[12..24]).unwrap();
+        let root_offset = root_extent.ee_start_lo as usize * BLOCK_SIZE;
+        let mut offset = 0;
+        let mut found_child = false;
+        while offset < BLOCK_SIZE {
+            let entry = Ext4DirEntry2Header::read_from_bytes(
+                &builder.disk_data[root_offset + offset..root_offset + offset + 8],
+            )
+            .unwrap();
+            let name_start = root_offset + offset + 8;
+            let entry_name = &builder.disk_data[name_start..name_start + entry.name_len as usize];
+            if entry_name == b"projects" {
+                let entry_inode = entry.inode;
+                assert_eq!(entry_inode, child_ino);
+                assert_eq!(entry.file_type, EXT4_FT_DIR);
+                found_child = true;
+                break;
+            }
+            offset += entry.rec_len as usize;
+        }
+        assert!(found_child, "parent directory is missing the child entry");
+
+        let group = ((child_ino - 1) / builder.superblock.s_inodes_per_group) as usize;
+        let local = ((child_ino - 1) % builder.superblock.s_inodes_per_group) as usize;
+        let child = &builder.groups[group].inode_table[local];
+        let child_mode = child.i_mode;
+        let child_links = child.i_links_count;
+        assert_eq!(child_mode & S_IFDIR, S_IFDIR);
+        assert_eq!(child_links, 2);
+
+        builder.write_to_file("target/mkdir-test.img").unwrap();
     }
 }
