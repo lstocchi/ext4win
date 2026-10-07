@@ -1,4 +1,6 @@
+mod allocation;
 mod builder;
+mod directory;
 mod ext4;
 
 use builder::Ext4ImageBuilder;
