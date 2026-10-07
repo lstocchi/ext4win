@@ -34,7 +34,7 @@ impl Ext4ImageBuilder {
         }
     }
 
-    fn directory_block(&self, ino: u32) -> Result<u32> {
+    fn read_dir_block_index(&self, ino: u32) -> Result<u32> {
         if !self.is_inode_allocated(ino) {
             return Err(anyhow::anyhow!("inode {ino} does not exist"));
         }
@@ -63,7 +63,7 @@ impl Ext4ImageBuilder {
         file_type: u8,
     ) -> Result<()> {
         Self::validate_name(name)?;
-        let (base, off, actual) = self.dir_entry_slot(parent, name)?;
+        let (base, off, actual) = self.find_dir_entry_slot(parent, name)?;
         let bytes = name.as_bytes();
         self.disk_data[base + off + 4..base + off + 6]
             .copy_from_slice(&(actual as u16).to_le_bytes());
@@ -81,10 +81,17 @@ impl Ext4ImageBuilder {
         Ok(())
     }
 
-    /// Validate a directory entry insertion without modifying its final record.
-    fn dir_entry_slot(&self, parent: u32, name: &str) -> Result<(usize, usize, usize)> {
+    /// Preflight check: verifies that the name is valid, does not already exist
+    /// in the parent directory, and that the directory block has enough space.
+    fn ensure_dir_entry_creatable(&self, parent: u32, name: &str) -> Result<()> {
+        self.find_dir_entry_slot(parent, name).map(|_| ())
+    }
+
+    /// Finds and returns the precise byte offsets `(base, off, actual)` for inserting
+    /// a new entry into the parent directory block.
+    fn find_dir_entry_slot(&self, parent: u32, name: &str) -> Result<(usize, usize, usize)> {
         Self::validate_name(name)?;
-        let base = self.directory_block(parent)? as usize * BLOCK_SIZE;
+        let base = self.read_dir_block_index(parent)? as usize * BLOCK_SIZE;
         let bytes = name.as_bytes();
         let needed = align4(8 + bytes.len());
         let mut off = 0;
@@ -121,7 +128,13 @@ impl Ext4ImageBuilder {
         ))
     }
 
-    fn apply_metadata(inode: &mut Ext4Inode, m: &PosixMetadata, kind: u16, default_perms: u16) {
+    /// Populates an in-memory Ext4Inode with POSIX metadata fields.
+    fn populate_inode_metadata(
+        inode: &mut Ext4Inode,
+        m: &PosixMetadata,
+        kind: u16,
+        default_perms: u16,
+    ) {
         let mode = if m.mode == 0 {
             default_perms
         } else {
@@ -143,7 +156,7 @@ impl Ext4ImageBuilder {
         let default_meta = PosixMetadata::default();
         let meta = meta.unwrap_or(&default_meta);
         let xattrs = prepare_xattrs(&meta.xattrs)?;
-        self.dir_entry_slot(parent, name)?;
+        self.ensure_dir_entry_creatable(parent, name)?;
         let preview_ino = self.next_free_inode(Some(parent))?;
         let (preview_group, _) = self.inode_location(preview_ino);
         self.ensure_allocation_capacity(preview_group, 1, u32::from(!xattrs.is_empty()))?;
@@ -182,8 +195,8 @@ impl Ext4ImageBuilder {
         inode.i_blocks_lo = (BLOCK_SIZE / 512) as u32;
         inode.i_flags = EXT4_EXTENTS_FL;
 
-        Self::apply_metadata(&mut inode, meta, S_IFDIR, 0o755);
-        set_extent(&mut inode, 1, data_block);
+        Self::populate_inode_metadata(&mut inode, meta, S_IFDIR, 0o755);
+        init_single_extent(&mut inode, 1, data_block);
         if !xattrs.is_empty() {
             inode.i_file_acl_lo = self.write_prepared_xattr_block(group, &xattrs)?;
             inode.i_blocks_lo += (BLOCK_SIZE / 512) as u32;
@@ -207,7 +220,7 @@ impl Ext4ImageBuilder {
     ) -> Result<u32> {
         Self::validate_name(name)?;
         let xattrs = prepare_xattrs(&meta.xattrs)?;
-        self.dir_entry_slot(parent, name)?;
+        self.ensure_dir_entry_creatable(parent, name)?;
 
         let blocks = data.len().div_ceil(BLOCK_SIZE);
         if blocks > BLOCKS_PER_GROUP {
@@ -235,14 +248,14 @@ impl Ext4ImageBuilder {
         }
 
         let mut inode = Ext4Inode::default();
-        Self::apply_metadata(&mut inode, meta, S_IFREG, 0o644);
+        Self::populate_inode_metadata(&mut inode, meta, S_IFREG, 0o644);
         inode.i_size_lo =
             u32::try_from(data.len()).map_err(|_| anyhow::anyhow!("file is larger than 4 GiB"))?;
         inode.i_links_count = 1;
         inode.i_blocks_lo = blocks as u32 * (BLOCK_SIZE / 512) as u32;
         inode.i_flags = EXT4_EXTENTS_FL;
 
-        set_extent(&mut inode, blocks as u16, start);
+        init_single_extent(&mut inode, blocks as u16, start);
         if !xattrs.is_empty() {
             inode.i_file_acl_lo = self.write_prepared_xattr_block(group, &xattrs)?;
             inode.i_blocks_lo += (BLOCK_SIZE / 512) as u32;
@@ -320,6 +333,80 @@ impl Ext4ImageBuilder {
 
         Ok(number)
     }
+
+    /// Create a symbolic link. Targets shorter than the inode's 60-byte
+    /// `i_block` field are stored inline; longer targets use one data block.
+    pub fn add_symlink(
+        &mut self,
+        parent: u32,
+        name: &str,
+        target: &str,
+        meta: &PosixMetadata,
+    ) -> Result<u32> {
+        Self::validate_name(name)?;
+        let xattrs = prepare_xattrs(&meta.xattrs)?;
+        self.ensure_dir_entry_creatable(parent, name)?;
+
+        let target_bytes = target.as_bytes();
+        // Match ext2fs_symlink(): the terminating NUL must fit in one block,
+        // so an empty target and targets up to BLOCK_SIZE - 1 bytes are valid.
+        if target_bytes.len() >= BLOCK_SIZE {
+            return Err(anyhow::anyhow!(
+                "symlink target must be no longer than {} bytes",
+                BLOCK_SIZE - 1
+            ));
+        }
+
+        // e2fsprogs defines fastlink as strictly less than i_block size (60 bytes)
+        let is_fastlink = target_bytes.len() < 60;
+        let block_needed = if is_fastlink { 0 } else { 1 };
+
+        let preview_ino = self.next_free_inode(Some(parent))?;
+        let (preview_group, _) = self.inode_location(preview_ino);
+
+        self.ensure_allocation_capacity(
+            preview_group,
+            block_needed as u32,
+            u32::from(!xattrs.is_empty()),
+        )?;
+
+        let ino = self.allocate_inode(Some(parent))?;
+        let (group, index_in_group) = self.inode_location(ino);
+
+        let mut inode = Ext4Inode::default();
+        Self::populate_inode_metadata(&mut inode, meta, S_IFLNK, 0o777);
+        inode.i_size_lo = target_bytes.len() as u32;
+        inode.i_links_count = 1;
+
+        if is_fastlink {
+            // Fast Symlink: Write directly into the 60-byte i_block array
+            inode.i_blocks_lo = 0;
+            inode.i_block[..target_bytes.len()].copy_from_slice(target_bytes);
+        } else {
+            // Note: e2fsprogs attempts inline_data here if the feature is enabled.
+            // Since this builder currently do not have inline_data support, we route
+            // directly to the slow block-allocated fallback.
+            let data_block = self.allocate_free_blocks(group, 1)?;
+            let offset = data_block as usize * BLOCK_SIZE;
+            // The e2fsprogs buffer is zero-initialized before copying the
+            // target, which supplies the NUL terminator and a zero-filled tail.
+            self.disk_data[offset..offset + BLOCK_SIZE].fill(0);
+            self.disk_data[offset..offset + target_bytes.len()].copy_from_slice(target_bytes);
+            inode.i_blocks_lo = (BLOCK_SIZE / 512) as u32;
+            inode.i_flags = EXT4_EXTENTS_FL;
+            init_single_extent(&mut inode, 1, data_block);
+        }
+
+        if !xattrs.is_empty() {
+            inode.i_file_acl_lo = self.write_prepared_xattr_block(group, &xattrs)?;
+            inode.i_blocks_lo += (BLOCK_SIZE / 512) as u32;
+        }
+
+        self.groups[group].inode_table[index_in_group] = inode;
+        self.add_dir_entry(parent, name, ino, EXT4_FT_SYMLINK)?;
+
+        Ok(ino)
+    }
 }
 
 fn align4(v: usize) -> usize {
@@ -340,7 +427,8 @@ fn xattr_entry_hash(name: &[u8], value: &[u8]) -> u32 {
     hash
 }
 
-fn set_extent(inode: &mut Ext4Inode, blocks: u16, start: u32) {
+/// Initializes a depth-0 inline extent header with a single contiguous extent.
+fn init_single_extent(inode: &mut Ext4Inode, blocks: u16, start: u32) {
     let extent_header = Ext4ExtentHeader {
         eh_magic: EXT4_EH_MAGIC,
         eh_entries: u16::from(blocks != 0),
@@ -557,5 +645,75 @@ mod tests {
             disk_acl,
             vec![1, 0, 0, 0, 1, 0, 7, 0, 4, 0, 5, 0, 32, 0, 5, 0]
         );
+    }
+
+    #[test]
+    fn symlinks_use_fast_and_slow_storage_at_e2fsprogs_boundary() {
+        let mut builder = fresh_builder().expect("failed to create builder");
+        let metadata = PosixMetadata::default();
+
+        let fast_ino = builder
+            .add_symlink(EXT4_ROOT_INO, "fast", &"f".repeat(59), &metadata)
+            .expect("failed to create fast symlink");
+        let (fast_group, fast_index) = builder.inode_location(fast_ino);
+        let fast = &builder.groups[fast_group].inode_table[fast_index];
+        let (fast_mode, fast_size, fast_blocks) = (fast.i_mode, fast.i_size_lo, fast.i_blocks_lo);
+        assert_eq!(fast_mode, S_IFLNK | 0o777);
+        assert_eq!(fast_size, 59);
+        assert_eq!(fast_blocks, 0);
+        assert_eq!(
+            &fast.i_block[..59],
+            b"fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        );
+
+        let target = "s".repeat(60);
+        let slow_ino = builder
+            .add_symlink(EXT4_ROOT_INO, "slow", &target, &metadata)
+            .expect("failed to create slow symlink");
+        let (slow_group, slow_index) = builder.inode_location(slow_ino);
+        let slow = &builder.groups[slow_group].inode_table[slow_index];
+        let extent = Ext4Extent::read_from_bytes(&slow.i_block[12..24]).unwrap();
+        let block_offset = extent.ee_start_lo as usize * BLOCK_SIZE;
+        let (slow_size, slow_blocks, extent_len) =
+            (slow.i_size_lo, slow.i_blocks_lo, extent.ee_len);
+        assert_eq!(slow_size, 60);
+        assert_eq!(slow_blocks, (BLOCK_SIZE / 512) as u32);
+        assert_eq!(extent_len, 1);
+        assert_eq!(
+            &builder.disk_data[block_offset..block_offset + 60],
+            target.as_bytes()
+        );
+        assert!(
+            builder.disk_data[block_offset + 60..block_offset + BLOCK_SIZE]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+    }
+
+    #[test]
+    fn symlink_target_may_be_empty_but_must_leave_room_for_nul() {
+        let mut builder = fresh_builder().expect("failed to create builder");
+        let metadata = PosixMetadata::default();
+        let free_inodes = builder.superblock.s_free_inodes_count;
+
+        let ino = builder
+            .add_symlink(EXT4_ROOT_INO, "empty", "", &metadata)
+            .expect("e2fsprogs permits an empty symlink target");
+        let (group, index) = builder.inode_location(ino);
+        let empty_size = builder.groups[group].inode_table[index].i_size_lo;
+        assert_eq!(empty_size, 0);
+
+        assert!(
+            builder
+                .add_symlink(
+                    EXT4_ROOT_INO,
+                    "too-long",
+                    &"x".repeat(BLOCK_SIZE),
+                    &metadata,
+                )
+                .is_err()
+        );
+        let remaining_inodes = builder.superblock.s_free_inodes_count;
+        assert_eq!(remaining_inodes, free_inodes - 1);
     }
 }

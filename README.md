@@ -44,6 +44,8 @@ The project currently creates a valid ext4 image containing:
 - initialized block and inode bitmaps, inode tables, the root directory, and
   `lost+found`.
 - regular-file creation with a single contiguous, depth-zero extent;
+- symbolic-link creation, using fast symlinks for targets shorter than 60 bytes
+  and a single data-block extent for longer targets;
 - directory creation, including `.` / `..` entries and parent link-count
   updates;
 - POSIX metadata for created files and directories: permissions, 32-bit UID
@@ -97,6 +99,7 @@ let metadata = PosixMetadata {
 
 let directory = builder.mkdir(EXT4_ROOT_INO, "app", Some(&metadata))?;
 builder.add_file(directory, "config", b"enabled=true\n", &metadata)?;
+builder.add_symlink(directory, "current", "config", &metadata)?;
 ```
 
 Xattr keys use their fully qualified Linux names, such as `user.comment`,
@@ -104,7 +107,10 @@ Xattr keys use their fully qualified Linux names, such as `user.comment`,
 `system.posix_acl_access`. Xattrs currently use one unshared external 4 KiB
 block per inode; oversized xattr sets are rejected before filesystem
 allocation state is changed. Regular files are similarly limited to one
-contiguous extent.
+contiguous extent. Symlink targets may be empty and are limited to
+`BLOCK_SIZE - 1` bytes (4,095 bytes with the current 4 KiB block size).
+Targets shorter than 60 bytes are stored directly in the inode; longer targets
+are stored in a single data block. Inline-data symlinks are not implemented.
 
 ## Verify the image in Linux or WSL
 
@@ -117,7 +123,8 @@ debugfs -R 'ea_list /test_dir/hello.txt' output.img
 ```
 
 `e2fsck -fn` must complete without proposing repairs. `debugfs` should list
-`hello.txt` and display its `user.creator` xattr.
+`hello.txt` and display its `user.creator` xattr. Images containing symlinks
+should show them with type `120777` in `debugfs -R 'ls -l …'` output.
 
 ## Design constraints
 
@@ -128,8 +135,8 @@ debugfs -R 'ea_list /test_dir/hello.txt' output.img
 - The current implementation uses 32-bit block addresses and 32-byte group
   descriptors.
 - Images are deliberately created without a journal at this stage.
-- The formatter supports only regular files and directories; it does not yet
-  create symlinks, device nodes, FIFOs, sockets, hard links, sparse files, or
+- The formatter supports regular files, directories, and symlinks. It does not
+  yet create device nodes, FIFOs, sockets, hard links, sparse files, or
   multi-extent files/directories.
 - Xattr block sharing/deduplication, inline xattrs, SELinux policy validation,
   and OCI whiteout semantics are not implemented.
