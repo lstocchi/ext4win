@@ -1,173 +1,561 @@
+use crate::{builder::Ext4ImageBuilder, ext4::*};
+use anyhow::Result;
+use std::collections::HashMap;
 use zerocopy::{FromBytes, IntoBytes};
 
-use crate::{builder::Ext4ImageBuilder, ext4::*};
+/// Metadata collected from an OCI layer or a host filesystem.
+#[derive(Clone, Debug, Default)]
+pub struct PosixMetadata {
+    pub mode: u16,
+    pub uid: u32,
+    pub gid: u32,
+    pub atime: u32,
+    pub ctime: u32,
+    pub mtime: u32,
+    pub xattrs: HashMap<String, Vec<u8>>,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedXattr {
+    index: u8,
+    suffix: String,
+    value: Vec<u8>,
+}
 
 impl Ext4ImageBuilder {
-    pub fn add_dir_entry(&mut self, parent_ino: u32, name: &str, child_ino: u32, file_type: u8) {
-        let inodes_per_group = self.superblock.s_inodes_per_group;
-        let parent_group = ((parent_ino - 1) / inodes_per_group) as usize;
-        let parent_index = ((parent_ino - 1) % inodes_per_group) as usize;
-        let extent = Ext4Extent::read_from_bytes(
-            &self.groups[parent_group].inode_table[parent_index].i_block[12..24],
-        )
-        .unwrap();
-        let block_offset = extent.ee_start_lo as usize * BLOCK_SIZE;
-        let name_bytes = name.as_bytes();
-        let name_len = name_bytes.len() as u8;
-        let needed_len = ((8 + name_len as u16 + 3) / 4) * 4;
-
-        let mut offset = 0;
-        while offset < BLOCK_SIZE {
-            let entry = Ext4DirEntry2Header::read_from_bytes(
-                &self.disk_data[block_offset + offset..block_offset + offset + 8],
-            )
-            .unwrap();
-            let rec_len = entry.rec_len as usize;
-            if offset + rec_len == BLOCK_SIZE {
-                let actual_len = ((8 + entry.name_len as usize + 3) / 4) * 4;
-                if rec_len - actual_len < needed_len as usize {
-                    panic!("Not enough space in the directory block to add entry for {name}");
-                }
-
-                self.disk_data[block_offset + offset + 4..block_offset + offset + 6]
-                    .copy_from_slice(&(actual_len as u16).to_le_bytes());
-                let new_offset = offset + actual_len;
-                let new_entry = Ext4DirEntry2Header {
-                    inode: child_ino,
-                    rec_len: (BLOCK_SIZE - new_offset) as u16,
-                    name_len,
-                    file_type,
-                };
-                self.disk_data[block_offset + new_offset..block_offset + new_offset + 8]
-                    .copy_from_slice(new_entry.as_bytes());
-                self.disk_data[block_offset + new_offset + 8
-                    ..block_offset + new_offset + 8 + name_len as usize]
-                    .copy_from_slice(name_bytes);
-                return;
-            }
-            offset += rec_len;
+    fn validate_name(name: &str) -> Result<()> {
+        if name.is_empty() || name == "." || name == ".." || name.len() > 255 || name.contains('/')
+        {
+            Err(anyhow::anyhow!(
+                "name must be a non-empty component no longer than 255 bytes"
+            ))
+        } else {
+            Ok(())
         }
-        panic!("invalid directory block for inode {parent_ino}");
     }
 
-    pub fn mkdir(&mut self, parent_ino: u32, name: &str) -> Result<u32, String> {
-        if name.is_empty()
-            || name == "."
-            || name == ".."
-            || name.len() > u8::MAX as usize
-            || name.contains('/')
-        {
-            return Err(
-                "directory name must be a non-empty component no longer than 255 bytes".to_string(),
-            );
+    fn directory_block(&self, ino: u32) -> Result<u32> {
+        if !self.is_inode_allocated(ino) {
+            return Err(anyhow::anyhow!("inode {ino} does not exist"));
         }
-        if parent_ino == 0
-            || parent_ino > self.superblock.s_inodes_count
-            || !self.is_inode_allocated(parent_ino)
-        {
-            return Err(format!("parent inode {parent_ino} does not exist"));
+        let (g, i) = self.inode_location(ino);
+        let inode = &self.groups[g].inode_table[i];
+        if inode.i_mode & S_IFDIR != S_IFDIR {
+            return Err(anyhow::anyhow!("inode {ino} is not a directory"));
+        }
+        let h = Ext4ExtentHeader::read_from_bytes(&inode.i_block[..12])
+            .map_err(|_| anyhow::anyhow!("invalid extent header"))?;
+        if h.eh_magic != EXT4_EH_MAGIC || h.eh_depth != 0 || h.eh_entries != 1 {
+            return Err(anyhow::anyhow!(
+                "inode {ino} has an unsupported directory extent"
+            ));
+        }
+        Ok(Ext4Extent::read_from_bytes(&inode.i_block[12..24])
+            .map_err(|_| anyhow::anyhow!("invalid directory extent"))?
+            .ee_start_lo)
+    }
+
+    pub fn add_dir_entry(
+        &mut self,
+        parent: u32,
+        name: &str,
+        child: u32,
+        file_type: u8,
+    ) -> Result<()> {
+        Self::validate_name(name)?;
+        let (base, off, actual) = self.dir_entry_slot(parent, name)?;
+        let bytes = name.as_bytes();
+        self.disk_data[base + off + 4..base + off + 6]
+            .copy_from_slice(&(actual as u16).to_le_bytes());
+        let new = off + actual;
+        self.disk_data[base + new..base + new + 8].copy_from_slice(
+            Ext4DirEntry2Header {
+                inode: child,
+                rec_len: (BLOCK_SIZE - new) as u16,
+                name_len: bytes.len() as u8,
+                file_type,
+            }
+            .as_bytes(),
+        );
+        self.disk_data[base + new + 8..base + new + 8 + bytes.len()].copy_from_slice(bytes);
+        Ok(())
+    }
+
+    /// Validate a directory entry insertion without modifying its final record.
+    fn dir_entry_slot(&self, parent: u32, name: &str) -> Result<(usize, usize, usize)> {
+        Self::validate_name(name)?;
+        let base = self.directory_block(parent)? as usize * BLOCK_SIZE;
+        let bytes = name.as_bytes();
+        let needed = align4(8 + bytes.len());
+        let mut off = 0;
+
+        while off < BLOCK_SIZE {
+            let e =
+                Ext4DirEntry2Header::read_from_bytes(&self.disk_data[base + off..base + off + 8])
+                    .map_err(|_| anyhow::anyhow!("invalid directory entry"))?;
+            let len = e.rec_len as usize;
+            if len < 8 || len % 4 != 0 || off + len > BLOCK_SIZE || e.name_len as usize + 8 > len {
+                return Err(anyhow::anyhow!(
+                    "directory inode {parent} has an invalid record"
+                ));
+            }
+            if e.inode != 0
+                && &self.disk_data[base + off + 8..base + off + 8 + e.name_len as usize] == bytes
+            {
+                return Err(anyhow::anyhow!("directory entry {name:?} already exists"));
+            }
+            if off + len == BLOCK_SIZE {
+                let actual = align4(8 + e.name_len as usize);
+                if len - actual < needed {
+                    return Err(anyhow::anyhow!(
+                        "directory inode {parent} has no space for {name:?}"
+                    ));
+                }
+                return Ok((base, off, actual));
+            }
+            off += len;
         }
 
-        let inodes_per_group = self.superblock.s_inodes_per_group;
-        let parent_group = ((parent_ino - 1) / inodes_per_group) as usize;
-        let parent_index = ((parent_ino - 1) % inodes_per_group) as usize;
-        let parent_mode = self.groups[parent_group].inode_table[parent_index].i_mode;
-        if parent_mode & S_IFDIR != S_IFDIR {
-            return Err(format!("parent inode {parent_ino} is not a directory"));
-        }
+        Err(anyhow::anyhow!(
+            "directory inode {parent} has no terminal entry"
+        ))
+    }
 
-        let dir_ino = self.allocate_inode(Some(parent_ino))?;
-        let group = ((dir_ino - 1) / inodes_per_group) as usize;
-        let index = ((dir_ino - 1) % inodes_per_group) as usize;
-        let data_block = self.allocate_free_block(group);
-        let mut dir_block = vec![0; BLOCK_SIZE];
-        let dot = Ext4DirEntry2Header {
-            inode: dir_ino,
+    fn apply_metadata(inode: &mut Ext4Inode, m: &PosixMetadata, kind: u16, default_perms: u16) {
+        let mode = if m.mode == 0 {
+            default_perms
+        } else {
+            m.mode & 0o7777
+        };
+        inode.i_mode = kind | mode;
+        inode.i_uid = m.uid as u16;
+        inode.i_gid = m.gid as u16;
+        inode.i_osd2[4..6].copy_from_slice(&((m.uid >> 16) as u16).to_le_bytes());
+        inode.i_osd2[6..8].copy_from_slice(&((m.gid >> 16) as u16).to_le_bytes());
+        inode.i_atime = m.atime;
+        inode.i_ctime = m.ctime;
+        inode.i_mtime = m.mtime;
+        inode.i_extra_isize = 32;
+    }
+
+    pub fn mkdir(&mut self, parent: u32, name: &str, meta: Option<&PosixMetadata>) -> Result<u32> {
+        Self::validate_name(name)?;
+        let default_meta = PosixMetadata::default();
+        let meta = meta.unwrap_or(&default_meta);
+        let xattrs = prepare_xattrs(&meta.xattrs)?;
+        self.dir_entry_slot(parent, name)?;
+        let preview_ino = self.next_free_inode(Some(parent))?;
+        let (preview_group, _) = self.inode_location(preview_ino);
+        self.ensure_allocation_capacity(preview_group, 1, u32::from(!xattrs.is_empty()))?;
+        let ino = self.allocate_inode(Some(parent))?;
+        let (group, index_in_group) = self.inode_location(ino);
+
+        let data_block = self.allocate_free_blocks(group, 1)?;
+        let mut block = vec![0; BLOCK_SIZE];
+
+        let dot_header = Ext4DirEntry2Header {
+            inode: ino,
             rec_len: 12,
             name_len: 1,
             file_type: EXT4_FT_DIR,
         };
-        let dotdot = Ext4DirEntry2Header {
-            inode: parent_ino,
+        let dot_entry = dot_header.as_bytes();
+        block[..8].copy_from_slice(dot_entry);
+        block[8] = b'.';
+
+        let dot_dot_header = Ext4DirEntry2Header {
+            inode: parent,
             rec_len: (BLOCK_SIZE - 12) as u16,
             name_len: 2,
             file_type: EXT4_FT_DIR,
         };
-        dir_block[..8].copy_from_slice(dot.as_bytes());
-        dir_block[8] = b'.';
-        dir_block[12..20].copy_from_slice(dotdot.as_bytes());
-        dir_block[20..22].copy_from_slice(b"..");
-        let disk_offset = data_block as usize * BLOCK_SIZE;
-        self.disk_data[disk_offset..disk_offset + BLOCK_SIZE].copy_from_slice(&dir_block);
+        let dot_dot_entry = dot_dot_header.as_bytes();
+        block[12..20].copy_from_slice(dot_dot_entry);
+        block[20..22].copy_from_slice(b"..");
+
+        self.disk_data[data_block as usize * BLOCK_SIZE..(data_block as usize + 1) * BLOCK_SIZE]
+            .copy_from_slice(&block);
 
         let mut inode = Ext4Inode::default();
-        inode.i_mode = S_IFDIR | 0o755;
         inode.i_size_lo = BLOCK_SIZE as u32;
         inode.i_links_count = 2;
         inode.i_blocks_lo = (BLOCK_SIZE / 512) as u32;
         inode.i_flags = EXT4_EXTENTS_FL;
-        let header = Ext4ExtentHeader {
-            eh_magic: EXT4_EH_MAGIC,
-            eh_entries: 1,
-            eh_max: 4,
-            eh_depth: 0,
-            eh_generation: 0,
+
+        Self::apply_metadata(&mut inode, meta, S_IFDIR, 0o755);
+        set_extent(&mut inode, 1, data_block);
+        if !xattrs.is_empty() {
+            inode.i_file_acl_lo = self.write_prepared_xattr_block(group, &xattrs)?;
+            inode.i_blocks_lo += (BLOCK_SIZE / 512) as u32;
+        }
+
+        self.groups[group].inode_table[index_in_group] = inode;
+        self.group_descriptors[group].bg_used_dirs_count_lo += 1;
+        self.add_dir_entry(parent, name, ino, EXT4_FT_DIR)?;
+        let (pgroup, pindex_in_group) = self.inode_location(parent);
+        self.groups[pgroup].inode_table[pindex_in_group].i_links_count += 1;
+        Ok(ino)
+    }
+
+    /// Create a regular file with one contiguous, depth-zero extent.
+    pub fn add_file(
+        &mut self,
+        parent: u32,
+        name: &str,
+        data: &[u8],
+        meta: &PosixMetadata,
+    ) -> Result<u32> {
+        Self::validate_name(name)?;
+        let xattrs = prepare_xattrs(&meta.xattrs)?;
+        self.dir_entry_slot(parent, name)?;
+
+        let blocks = data.len().div_ceil(BLOCK_SIZE);
+        if blocks > BLOCKS_PER_GROUP {
+            return Err(anyhow::anyhow!("file is too large for a single extent"));
+        }
+        let preview_ino = self.next_free_inode(Some(parent))?;
+        let (preview_group, _) = self.inode_location(preview_ino);
+        self.ensure_allocation_capacity(
+            preview_group,
+            blocks as u32,
+            u32::from(!xattrs.is_empty()),
+        )?;
+
+        let ino = self.allocate_inode(Some(parent))?;
+        let (group, index_in_group) = self.inode_location(ino);
+        let start = if blocks == 0 {
+            0
+        } else {
+            self.allocate_free_blocks(group, blocks as u32)?
         };
+
+        if !data.is_empty() {
+            let offset = start as usize * BLOCK_SIZE;
+            self.disk_data[offset..offset + data.len()].copy_from_slice(data);
+        }
+
+        let mut inode = Ext4Inode::default();
+        Self::apply_metadata(&mut inode, meta, S_IFREG, 0o644);
+        inode.i_size_lo =
+            u32::try_from(data.len()).map_err(|_| anyhow::anyhow!("file is larger than 4 GiB"))?;
+        inode.i_links_count = 1;
+        inode.i_blocks_lo = blocks as u32 * (BLOCK_SIZE / 512) as u32;
+        inode.i_flags = EXT4_EXTENTS_FL;
+
+        set_extent(&mut inode, blocks as u16, start);
+        if !xattrs.is_empty() {
+            inode.i_file_acl_lo = self.write_prepared_xattr_block(group, &xattrs)?;
+            inode.i_blocks_lo += (BLOCK_SIZE / 512) as u32;
+        }
+
+        self.groups[group].inode_table[index_in_group] = inode;
+        self.add_dir_entry(parent, name, ino, EXT4_FT_REG_FILE)?;
+
+        Ok(ino)
+    }
+
+    /// External, unshared xattr block. Its layout matches ext2fs' ext_attr format.
+    pub fn write_xattr_block(
+        &mut self,
+        group: usize,
+        xattrs: &HashMap<String, Vec<u8>>,
+    ) -> Result<u32> {
+        let xattrs = prepare_xattrs(xattrs)?;
+        self.write_prepared_xattr_block(group, &xattrs)
+    }
+
+    fn write_prepared_xattr_block(
+        &mut self,
+        group: usize,
+        xattrs: &[PreparedXattr],
+    ) -> Result<u32> {
+        let mut data = vec![0; BLOCK_SIZE];
+
+        let xattr_header = Ext4XattrHeader {
+            h_magic: EXT4_XATTR_MAGIC,
+            h_refcount: 1,
+            h_blocks: 1,
+            ..Default::default()
+        };
+        data[..32].copy_from_slice(xattr_header.as_bytes());
+
+        let (mut entry, mut value) = (32, BLOCK_SIZE);
+        let mut block_hash = 0u32;
+        for xattr in xattrs {
+            let aligned_contents_len = align4(xattr.value.len());
+            value = value
+                .checked_sub(aligned_contents_len)
+                .ok_or(anyhow::anyhow!("xattrs exceed one filesystem block"))?;
+            let entry_len = 16 + align4(xattr.suffix.len());
+            if entry + entry_len + 4 > value {
+                return Err(anyhow::anyhow!("xattrs exceed one filesystem block"));
+            }
+
+            let xattr_entry = Ext4XattrEntry {
+                e_name_len: xattr.suffix.len() as u8,
+                e_name_index: xattr.index,
+                e_value_offs: value as u16,
+                e_value_block: 0,
+                e_value_size: xattr.value.len() as u32,
+                e_hash: xattr_entry_hash(xattr.suffix.as_bytes(), &xattr.value),
+            };
+            data[entry..entry + 16].copy_from_slice(xattr_entry.as_bytes());
+
+            let entry_hash = xattr_entry_hash(xattr.suffix.as_bytes(), &xattr.value);
+            block_hash = block_hash.rotate_left(16) ^ entry_hash;
+            data[entry + 16..entry + 16 + xattr.suffix.len()]
+                .copy_from_slice(xattr.suffix.as_bytes());
+            data[value..value + xattr.value.len()].copy_from_slice(&xattr.value);
+            entry += entry_len;
+        }
+
+        // e2fsprogs uses this hash to identify an external attribute block.
+        // A nonzero hash is required even when we deliberately do not deduplicate blocks.
+        data[12..16].copy_from_slice(&block_hash.to_le_bytes());
+        // All serialization can fail before this allocation; after it, this
+        // function has no fallible path and cannot leak a reserved block.
+        let number = self.allocate_free_blocks(group, 1)?;
+        let offset = number as usize * BLOCK_SIZE;
+        self.disk_data[offset..offset + BLOCK_SIZE].copy_from_slice(&data);
+
+        Ok(number)
+    }
+}
+
+fn align4(v: usize) -> usize {
+    (v + 3) & !3
+}
+
+/// ext2fs' name/value rolling hashes (NAME_HASH_SHIFT=5, VALUE_HASH_SHIFT=16).
+fn xattr_entry_hash(name: &[u8], value: &[u8]) -> u32 {
+    let mut hash = 0u32;
+    for byte in name {
+        hash = hash.rotate_left(5) ^ u32::from(*byte);
+    }
+    for bytes in value.chunks(4) {
+        let mut word = [0u8; 4];
+        word[..bytes.len()].copy_from_slice(bytes);
+        hash = hash.rotate_left(16) ^ u32::from_le_bytes(word);
+    }
+    hash
+}
+
+fn set_extent(inode: &mut Ext4Inode, blocks: u16, start: u32) {
+    let extent_header = Ext4ExtentHeader {
+        eh_magic: EXT4_EH_MAGIC,
+        eh_entries: u16::from(blocks != 0),
+        eh_max: 4,
+        eh_depth: 0,
+        eh_generation: 0,
+    };
+    inode.i_block[..12].copy_from_slice(extent_header.as_bytes());
+    if blocks != 0 {
         let extent = Ext4Extent {
             ee_block: 0,
-            ee_len: 1,
+            ee_len: blocks,
             ee_start_hi: 0,
-            ee_start_lo: data_block,
+            ee_start_lo: start,
         };
-        inode.i_block[..12].copy_from_slice(header.as_bytes());
         inode.i_block[12..24].copy_from_slice(extent.as_bytes());
-        self.groups[group].inode_table[index] = inode;
-        self.group_descriptors[group].bg_used_dirs_count_lo += 1;
-        self.add_dir_entry(parent_ino, name, dir_ino, EXT4_FT_DIR);
-        self.groups[parent_group].inode_table[parent_index].i_links_count += 1;
-        Ok(dir_ino)
     }
+}
+
+pub fn parse_xattr_name(name: &str) -> Result<(u8, &str)> {
+    for (prefix, index) in [
+        ("system.posix_acl_access", EXT4_XATTR_INDEX_POSIX_ACL_ACCESS),
+        (
+            "system.posix_acl_default",
+            EXT4_XATTR_INDEX_POSIX_ACL_DEFAULT,
+        ),
+        ("user.", EXT4_XATTR_INDEX_USER),
+        ("trusted.", EXT4_XATTR_INDEX_TRUSTED),
+        ("security.", EXT4_XATTR_INDEX_SECURITY),
+        ("system.", EXT4_XATTR_INDEX_SYSTEM),
+    ] {
+        if let Some(suffix) = name.strip_prefix(prefix) {
+            return Ok((index, suffix));
+        }
+    }
+    Err(anyhow::anyhow!(
+        "unsupported ext4 xattr namespace in {name:?}"
+    ))
+}
+
+fn prepare_xattrs(xattrs: &HashMap<String, Vec<u8>>) -> Result<Vec<PreparedXattr>> {
+    let mut prepared = Vec::with_capacity(xattrs.len());
+    for (name, value) in xattrs {
+        let (index, suffix) = parse_xattr_name(name)?;
+        // POSIX ACL attributes have no suffix. Other ext4 namespaces require one.
+        if suffix.len() > u8::MAX as usize
+            || (suffix.is_empty()
+                && !matches!(
+                    index,
+                    EXT4_XATTR_INDEX_POSIX_ACL_ACCESS | EXT4_XATTR_INDEX_POSIX_ACL_DEFAULT
+                ))
+        {
+            return Err(anyhow::anyhow!("invalid xattr name {name:?}"));
+        }
+        let value = if matches!(
+            index,
+            EXT4_XATTR_INDEX_POSIX_ACL_ACCESS | EXT4_XATTR_INDEX_POSIX_ACL_DEFAULT
+        ) {
+            posix_acl_to_ext4_disk(value)?
+        } else {
+            value.clone()
+        };
+        prepared.push(PreparedXattr {
+            index,
+            suffix: suffix.to_owned(),
+            value,
+        });
+    }
+    prepared.sort_unstable_by(|left, right| {
+        (left.index, &left.suffix).cmp(&(right.index, &right.suffix))
+    });
+    Ok(prepared)
+}
+
+// Linux's getxattr ABI uses 8-byte entries; ext4 stores object/group/mask/
+// other entries in four bytes, exactly as e2fsprogs' convert_posix_acl_to_disk_buffer.
+fn posix_acl_to_ext4_disk(value: &[u8]) -> Result<Vec<u8>> {
+    const POSIX_ACL_XATTR_VERSION: u32 = 0x0002;
+    const EXT4_ACL_VERSION: u32 = 0x0001;
+    const ACL_USER_OBJ: u16 = 0x01;
+    const ACL_USER: u16 = 0x02;
+    const ACL_GROUP_OBJ: u16 = 0x04;
+    const ACL_GROUP: u16 = 0x08;
+    const ACL_MASK: u16 = 0x10;
+    const ACL_OTHER: u16 = 0x20;
+
+    if value.len() < 12
+        || (value.len() - 4) % 8 != 0
+        || u32::from_le_bytes(value[..4].try_into().unwrap()) != POSIX_ACL_XATTR_VERSION
+    {
+        return Err(anyhow::anyhow!("invalid POSIX ACL xattr payload"));
+    }
+    let mut disk = Vec::with_capacity(value.len());
+    disk.extend_from_slice(&EXT4_ACL_VERSION.to_le_bytes());
+    for entry in value[4..].chunks_exact(8) {
+        let tag = u16::from_le_bytes(entry[..2].try_into().unwrap());
+        let perm = u16::from_le_bytes(entry[2..4].try_into().unwrap());
+        if perm > 0o7 {
+            return Err(anyhow::anyhow!("POSIX ACL permissions exceed 0o7"));
+        }
+        disk.extend_from_slice(&tag.to_le_bytes());
+        disk.extend_from_slice(&perm.to_le_bytes());
+        match tag {
+            ACL_USER | ACL_GROUP => disk.extend_from_slice(&entry[4..8]),
+            ACL_USER_OBJ | ACL_GROUP_OBJ | ACL_MASK | ACL_OTHER => {}
+            _ => return Err(anyhow::anyhow!("unsupported POSIX ACL tag {tag:#x}")),
+        }
+    }
+    Ok(disk)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn mkdir_creates_a_reachable_directory_without_double_accounting() {
+    fn fresh_builder() -> Result<Ext4ImageBuilder> {
         let mut builder = Ext4ImageBuilder::new(16);
-        builder.create_root_dir();
-        builder.create_lost_and_found();
+        builder.create_root_dir()?;
+        builder.create_lost_and_found()?;
         builder.reserve_inodes();
-        let free_before = builder.superblock.s_free_inodes_count;
-        let child_ino = builder.mkdir(EXT4_ROOT_INO, "projects").unwrap();
+        Ok(builder)
+    }
 
-        assert!(builder.is_inode_allocated(child_ino));
-        let free_after = builder.superblock.s_free_inodes_count;
-        let root_links = builder.groups[0].inode_table[1].i_links_count;
-        assert_eq!(free_after, free_before - 1);
-        assert_eq!(root_links, 4);
+    #[test]
+    fn file_is_linked_and_uses_contiguous_extent_and_xattrs() {
+        let mut builder = fresh_builder().expect("failed to create builder");
+        let mut metadata = PosixMetadata {
+            mode: 0o640,
+            uid: 70_000,
+            gid: 80_000,
+            mtime: 42,
+            ..Default::default()
+        };
+        metadata
+            .xattrs
+            .insert("user.note".into(), b"metadata".to_vec());
+        let ino = builder
+            .add_file(EXT4_ROOT_INO, "payload", &[7; BLOCK_SIZE + 10], &metadata)
+            .expect("failed to add file");
+        let (group, index) = builder.inode_location(ino);
+        let inode = &builder.groups[group].inode_table[index];
+        let mode = inode.i_mode;
+        let size = inode.i_size_lo;
+        let sectors = inode.i_blocks_lo;
+        let xattr_block = inode.i_file_acl_lo;
+        assert_eq!(mode, S_IFREG | 0o640);
+        assert_eq!(size, (BLOCK_SIZE + 10) as u32);
+        assert_eq!(sectors, 24); // two payload blocks plus one xattr block, in sectors
+        assert_ne!(xattr_block, 0);
+        let extent = Ext4Extent::read_from_bytes(&inode.i_block[12..24]).unwrap();
+        let extent_len = extent.ee_len;
+        let extent_start = extent.ee_start_lo;
+        assert_eq!(extent_len, 2);
+        assert_eq!(
+            &builder.disk_data[extent_start as usize * BLOCK_SIZE
+                ..extent_start as usize * BLOCK_SIZE + BLOCK_SIZE + 10],
+            &[7; BLOCK_SIZE + 10]
+        );
+    }
 
-        let root_extent =
-            Ext4Extent::read_from_bytes(&builder.groups[0].inode_table[1].i_block[12..24]).unwrap();
-        let root_offset = root_extent.ee_start_lo as usize * BLOCK_SIZE;
-        let mut offset = 0;
-        let mut found = false;
-        while offset < BLOCK_SIZE {
-            let entry = Ext4DirEntry2Header::read_from_bytes(
-                &builder.disk_data[root_offset + offset..root_offset + offset + 8],
-            )
-            .unwrap();
-            let start = root_offset + offset + 8;
-            if &builder.disk_data[start..start + entry.name_len as usize] == b"projects" {
-                let inode = entry.inode;
-                assert_eq!(inode, child_ino);
-                found = true;
-                break;
-            }
-            offset += entry.rec_len as usize;
+    #[test]
+    fn metadata_directory_has_expected_type_and_parent_link() {
+        let mut builder = fresh_builder().expect("failed to create builder");
+        let metadata = PosixMetadata {
+            mode: 0o750,
+            uid: 1,
+            gid: 2,
+            ..Default::default()
+        };
+        let ino = builder
+            .mkdir(EXT4_ROOT_INO, "layers", Some(&metadata))
+            .expect("failed to create directory");
+        let (group, index) = builder.inode_location(ino);
+        let mode = builder.groups[group].inode_table[index].i_mode;
+        let links = builder.groups[0].inode_table[1].i_links_count;
+        assert_eq!(mode, S_IFDIR | 0o750);
+        assert_eq!(links, 4);
+    }
+
+    #[test]
+    fn failed_preflight_does_not_allocate_inode_or_blocks() {
+        let mut builder = fresh_builder().expect("failed to create builder");
+        let free_inodes = builder.superblock.s_free_inodes_count;
+        let free_blocks = builder.superblock.s_free_blocks_count_lo;
+        let mut metadata = PosixMetadata::default();
+        metadata.xattrs.insert("invalid.namespace".into(), vec![1]);
+        assert!(
+            builder
+                .add_file(EXT4_ROOT_INO, "bad", b"data", &metadata)
+                .is_err()
+        );
+        let current_free_inodes = builder.superblock.s_free_inodes_count;
+        let current_free_blocks = builder.superblock.s_free_blocks_count_lo;
+        assert_eq!(current_free_inodes, free_inodes);
+        assert_eq!(current_free_blocks, free_blocks);
+        assert!(
+            builder
+                .add_file(0, "bad-parent", b"", &PosixMetadata::default())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn posix_acl_is_converted_to_compact_ext4_encoding() {
+        let mut host_acl = Vec::new();
+        host_acl.extend_from_slice(&2u32.to_le_bytes());
+        for (tag, perm, id) in [(0x01u16, 7u16, 0u32), (0x04, 5, 0), (0x20, 5, 0)] {
+            host_acl.extend_from_slice(&tag.to_le_bytes());
+            host_acl.extend_from_slice(&perm.to_le_bytes());
+            host_acl.extend_from_slice(&id.to_le_bytes());
         }
-        assert!(found);
-        builder.write_to_file("target/mkdir-test.img").unwrap();
+        let disk_acl = posix_acl_to_ext4_disk(&host_acl).unwrap();
+        assert_eq!(
+            disk_acl,
+            vec![1, 0, 0, 0, 1, 0, 7, 0, 4, 0, 5, 0, 32, 0, 5, 0]
+        );
     }
 }

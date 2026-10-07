@@ -35,7 +35,7 @@ mount -t ext4 /dev/vdb /mnt/app
 
 ## Current status
 
-The project currently creates an empty, valid ext4 image containing:
+The project currently creates a valid ext4 image containing:
 
 - a 4 KiB block size and 256-byte inodes;
 - extents and directory-entry file types;
@@ -43,6 +43,27 @@ The project currently creates an empty, valid ext4 image containing:
   tables;
 - initialized block and inode bitmaps, inode tables, the root directory, and
   `lost+found`.
+- regular-file creation with a single contiguous, depth-zero extent;
+- directory creation, including `.` / `..` entries and parent link-count
+  updates;
+- POSIX metadata for created files and directories: permissions, 32-bit UID
+  and GID, and access/change/modification timestamps;
+- external ext4 xattr blocks, including deterministic entry ordering and
+  e2fsprogs-compatible entry and block hashes; and
+- conversion of Linux `system.posix_acl_access` and
+  `system.posix_acl_default` xattr values into ext4's compact ACL encoding.
+
+The demonstration image currently contains:
+
+```text
+/
+├── lost+found/
+└── test_dir/
+    └── hello.txt
+```
+
+`hello.txt` contains `Created by ext4win` and has the xattr
+`user.creator=ext4win`.
 
 The current prototype does **not yet** import OCI layers, traverse host
 directories, or expose the planned `from-oci` / `inject` commands. It is the
@@ -57,22 +78,46 @@ cargo run -- output.img
 ```
 
 This currently creates a 400 MiB ext4 image named `output.img` in the current
-directory. An output path can be supplied as the first argument.
+directory. An output path can be supplied as the first argument. The image
+size and sample tree are currently defined in `src/main.rs`; command-line OCI
+or host-directory import has not been implemented yet.
+
+## Metadata API
+
+Library code supplies `PosixMetadata` to `add_file` and optionally to `mkdir`:
+
+```rust
+let metadata = PosixMetadata {
+    mode: 0o640,
+    uid: 1000,
+    gid: 1000,
+    mtime: 1_700_000_000,
+    ..Default::default()
+};
+
+let directory = builder.mkdir(EXT4_ROOT_INO, "app", Some(&metadata))?;
+builder.add_file(directory, "config", b"enabled=true\n", &metadata)?;
+```
+
+Xattr keys use their fully qualified Linux names, such as `user.comment`,
+`security.capability`, `trusted.overlay.opaque`, and
+`system.posix_acl_access`. Xattrs currently use one unshared external 4 KiB
+block per inode; oversized xattr sets are rejected before filesystem
+allocation state is changed. Regular files are similarly limited to one
+contiguous extent.
 
 ## Verify the image in Linux or WSL
 
 Validation should always include a read-only filesystem check:
 
 ```sh
-file -s output.img
-blkid output.img
 e2fsck -fn output.img
+debugfs -R 'ls -l /test_dir' output.img
+debugfs -R 'ea_list /test_dir/hello.txt' output.img
 ```
 
-`blkid` should report `TYPE="ext4"`. `file` may use the legacy phrase “ext2
-filesystem data” while also reporting extents; that description alone does
-not mean the image is invalid. The authoritative check is `e2fsck -fn`, which
-must complete without proposing repairs.
+`e2fsck -fn` must complete without proposing repairs. `debugfs` should list
+`hello.txt` and display its `user.creator` xattr.
 
 ## Design constraints
 
@@ -82,9 +127,14 @@ must complete without proposing repairs.
   image buffer using on-disk ext4 structures.
 - The current implementation uses 32-bit block addresses and 32-byte group
   descriptors.
-- Images are deliberately created without a journal at this stage. Journal
-  creation, timestamps, UUID generation, permissions/ownership mapping, and
-  robust error handling are planned before this is used for production data.
+- Images are deliberately created without a journal at this stage.
+- The formatter supports only regular files and directories; it does not yet
+  create symlinks, device nodes, FIFOs, sockets, hard links, sparse files, or
+  multi-extent files/directories.
+- Xattr block sharing/deduplication, inline xattrs, SELinux policy validation,
+  and OCI whiteout semantics are not implemented.
+- UUID generation and OCI/host metadata extraction are still planned. The
+  caller is responsible for supplying validated `PosixMetadata` values.
 
 ## Development
 

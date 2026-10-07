@@ -1,3 +1,4 @@
+use anyhow::Result;
 use std::{fs::File, io::Write};
 
 use zerocopy::IntoBytes;
@@ -24,7 +25,7 @@ impl Ext4ImageBuilder {
         let image_size_bytes = size_mb * 1024 * 1024;
         let blocks_number = image_size_bytes / BLOCK_SIZE;
 
-        let block_groups_number = (blocks_number + BLOCKS_PER_GROUP - 1) / BLOCKS_PER_GROUP;
+        let block_groups_number = blocks_number.div_ceil(BLOCKS_PER_GROUP);
 
         let target_inodes = image_size_bytes / BYTES_PER_INODE_RATIO;
         let mut inodes_per_group = target_inodes / block_groups_number;
@@ -118,14 +119,14 @@ impl Ext4ImageBuilder {
         self.superblock.s_free_blocks_count_lo -= 1;
     }
 
-    pub(crate) fn mark_inode_used(&mut self, group_idx: usize, inode: u32) {
-        let local_inode_idx = (inode - 1) % self.superblock.s_inodes_per_group;
-        let byte_idx = (local_inode_idx / 8) as usize;
-        let bit_idx = local_inode_idx % 8;
+    pub(crate) fn mark_inode_used(&mut self, inode: u32) {
+        let (group, index_in_group) = self.inode_location(inode);
+        let byte_idx = (index_in_group / 8) as usize;
+        let bit_idx = index_in_group % 8;
 
-        self.groups[group_idx].inode_bitmap[byte_idx] |= 1 << bit_idx;
-        self.groups[group_idx].free_inodes_count -= 1;
-        self.group_descriptors[group_idx].bg_free_inodes_count_lo -= 1;
+        self.groups[group].inode_bitmap[byte_idx] |= 1 << bit_idx;
+        self.groups[group].free_inodes_count -= 1;
+        self.group_descriptors[group].bg_free_inodes_count_lo -= 1;
         self.superblock.s_free_inodes_count -= 1;
     }
 
@@ -149,7 +150,7 @@ impl Ext4ImageBuilder {
 
         // Calculate how many blocks the Group Descriptor Table (GDT) takes
         let gdt_bytes = block_groups_number * std::mem::size_of::<Ext4GroupDesc>();
-        let gdt_blocks = (gdt_bytes + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        let gdt_blocks = gdt_bytes.div_ceil(BLOCK_SIZE);
 
         let inodes_per_group = self.superblock.s_inodes_per_group as usize;
         let itable_blocks = (inodes_per_group * INODE_SIZE) / BLOCK_SIZE;
@@ -245,26 +246,83 @@ impl Ext4ImageBuilder {
         }
     }
 
-    pub(crate) fn allocate_free_block(&mut self, group_idx: usize) -> u32 {
-        for local_bit in 0..BLOCKS_PER_GROUP {
-            let byte_idx = (local_bit / 8) as usize;
-            let bit_idx = local_bit % 8;
-            if self.groups[group_idx].block_bitmap[byte_idx] & (1 << bit_idx) == 0 {
-                // the block is free, mark it as used
-                self.groups[group_idx].block_bitmap[byte_idx] |= 1 << bit_idx;
-                self.groups[group_idx].free_blocks_count -= 1;
-                self.group_descriptors[group_idx].bg_free_blocks_count_lo -= 1;
-                self.superblock.s_free_blocks_count_lo -= 1;
-
-                let group_start_block = (group_idx * BLOCKS_PER_GROUP) as u32;
-                return group_start_block + local_bit as u32;
+    /// Reserve a contiguous extent, preferring the inode's block group and
+    /// wrapping to later groups when necessary.
+    pub(crate) fn allocate_free_blocks(
+        &mut self,
+        preferred_group: usize,
+        blocks_needed: u32,
+    ) -> Result<u32> {
+        if blocks_needed == 0 {
+            return Ok(0);
+        }
+        for delta in 0..self.groups.len() {
+            let group = (preferred_group + delta) % self.groups.len();
+            let limit = self.groups[group].blocks_count as usize;
+            let mut candidate_start = 0;
+            let mut contiguous_free = 0;
+            for bit in 0..limit {
+                // if block is free, if contiguous_free is 0, set candidate_start to bit, otherwise increment contiguous_free
+                if self.groups[group].block_bitmap[bit / 8] & (1 << (bit % 8)) == 0 {
+                    if contiguous_free == 0 {
+                        candidate_start = bit;
+                    }
+                    contiguous_free += 1;
+                    if contiguous_free == blocks_needed {
+                        for allocated in candidate_start..candidate_start + blocks_needed as usize {
+                            self.groups[group].block_bitmap[allocated / 8] |= 1 << (allocated % 8);
+                        }
+                        self.groups[group].free_blocks_count -= blocks_needed as u16;
+                        self.group_descriptors[group].bg_free_blocks_count_lo -=
+                            blocks_needed as u16;
+                        self.superblock.s_free_blocks_count_lo -= blocks_needed;
+                        return Ok((group * BLOCKS_PER_GROUP + candidate_start) as u32);
+                    }
+                } else {
+                    contiguous_free = 0;
+                }
             }
         }
-        panic!("No free block found in group {}", group_idx);
+        Err(anyhow::anyhow!(
+            "no contiguous run of {blocks_needed} free blocks is available"
+        ))
     }
 
-    pub fn create_root_dir(&mut self) {
-        let root_data_block = self.allocate_free_block(0);
+    /// Prove that a file extent plus any separately allocated metadata block
+    /// can be allocated before changing the block bitmap.
+    pub(crate) fn ensure_allocation_capacity(
+        &self,
+        preferred_group: usize,
+        extent_blocks: u32,
+        metadata_blocks: u32,
+    ) -> Result<()> {
+        if self.superblock.s_free_blocks_count_lo < extent_blocks + metadata_blocks {
+            return Err(anyhow::anyhow!("not enough free blocks"));
+        }
+        if extent_blocks == 0 {
+            return Ok(());
+        }
+        for delta in 0..self.groups.len() {
+            let group = (preferred_group + delta) % self.groups.len();
+            let mut run = 0u32;
+            for bit in 0..self.groups[group].blocks_count as usize {
+                if self.groups[group].block_bitmap[bit / 8] & (1 << (bit % 8)) == 0 {
+                    run += 1;
+                    if run == extent_blocks {
+                        return Ok(());
+                    }
+                } else {
+                    run = 0;
+                }
+            }
+        }
+        Err(anyhow::anyhow!(
+            "no contiguous run of {extent_blocks} free blocks is available"
+        ))
+    }
+
+    pub fn create_root_dir(&mut self) -> Result<()> {
+        let root_data_block = self.allocate_free_blocks(0, 1)?;
 
         let mut dir_block = vec![0u8; BLOCK_SIZE];
 
@@ -327,15 +385,17 @@ impl Ext4ImageBuilder {
         // save inode #2 in group 0's inode_table
         self.groups[0].inode_table[1] = root_inode;
 
-        self.mark_inode_used(0, EXT4_ROOT_INO);
+        self.mark_inode_used(EXT4_ROOT_INO);
 
         self.group_descriptors[0].bg_used_dirs_count_lo += 1;
+
+        Ok(())
     }
 
-    pub fn create_lost_and_found(&mut self) {
+    pub fn create_lost_and_found(&mut self) -> Result<()> {
         let lpf_inode_num = EXT4_FIRST_INO;
 
-        let lpf_data_block = self.allocate_free_block(0);
+        let lpf_data_block = self.allocate_free_blocks(0, 1)?;
 
         let mut dir_block = vec![0u8; BLOCK_SIZE];
 
@@ -367,7 +427,7 @@ impl Ext4ImageBuilder {
         // Expand lost+found with empty directory blocks (up to 16KB = 4 blocks)
         let mut allocated_blocks = vec![lpf_data_block];
         for _ in 1..4 {
-            let new_block = self.allocate_free_block(0);
+            let new_block = self.allocate_free_blocks(0, 1)?;
             allocated_blocks.push(new_block);
 
             // An empty expanded directory block has a single dummy header with inode = 0
@@ -415,21 +475,24 @@ impl Ext4ImageBuilder {
 
         let local_inode_idx = lpf_inode_num - 1;
         self.groups[0].inode_table[local_inode_idx as usize] = lpf_inode;
-        self.mark_inode_used(0, lpf_inode_num);
+        self.mark_inode_used(lpf_inode_num);
 
-        self.add_dir_entry(EXT4_ROOT_INO, "lost+found", lpf_inode_num, EXT4_FT_DIR);
+        self.add_dir_entry(EXT4_ROOT_INO, "lost+found", lpf_inode_num, EXT4_FT_DIR)
+            .expect("lost+found must fit in the root directory");
 
         // update root inode's link count (due to lost+found/.. directory pointing to root)
         self.groups[0].inode_table[1].i_links_count += 1;
         self.group_descriptors[0].bg_used_dirs_count_lo += 1;
+
+        Ok(())
     }
 
     pub fn reserve_inodes(&mut self) {
-        self.mark_inode_used(0, EXT4_BAD_INO);
+        self.mark_inode_used(EXT4_BAD_INO);
 
         // Skip Root (#2) and lost+found (#11), mark remaining 3..=10
         for inode_num in (EXT4_ROOT_INO + 1)..EXT4_FIRST_INO {
-            self.mark_inode_used(0, inode_num);
+            self.mark_inode_used(inode_num);
         }
     }
 
